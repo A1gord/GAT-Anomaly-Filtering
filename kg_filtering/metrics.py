@@ -1,5 +1,7 @@
 import torch
 
+from .decisions import best_curve_index, confusion_curve, probability_vectors
+
 
 def compute_sample_weights(labels):
     counts = torch.bincount(labels.long(), minlength=2).clamp_min(1)
@@ -18,8 +20,7 @@ def precision_recall_f1(y_true, y_pred):
 
 
 def evaluate_binary(labels, probabilities, threshold):
-    labels = torch.as_tensor(labels).cpu()
-    probabilities = torch.as_tensor(probabilities).cpu()
+    labels, probabilities = probability_vectors(labels, probabilities)
     if labels.shape != probabilities.shape or not labels.numel():
         raise ValueError('Metrics require equally sized nonempty vectors')
     if not torch.isfinite(probabilities).all() or ((probabilities < 0) | (probabilities > 1)).any():
@@ -37,9 +38,10 @@ def evaluate_binary(labels, probabilities, threshold):
 
 
 def find_best_threshold(labels, probabilities, threshold_min, threshold_max, threshold_steps):
-    thresholds = torch.linspace(threshold_min, threshold_max, threshold_steps).tolist()
-    scored = [(threshold, evaluate_binary(labels, probabilities, threshold)) for threshold in thresholds]
-    return max(scored, key=lambda pair: (pair[1]['f1'], -abs(pair[0] - 0.5), -pair[0]))
+    thresholds = torch.linspace(threshold_min, threshold_max, threshold_steps)
+    curve = confusion_curve(labels, probabilities, thresholds)
+    threshold = float(curve.thresholds[best_curve_index(curve)])
+    return threshold, evaluate_binary(labels, probabilities, threshold)
 
 
 def select_threshold(labels, probabilities, config):

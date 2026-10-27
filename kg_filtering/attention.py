@@ -20,6 +20,7 @@ class HeadProjection(nn.Module):
 class RelationAwareAttention(nn.Module):
     def __init__(self, inputs: int, relation_dim: int, channels: int, heads: int, concat: bool, config: Config) -> None:
         super().__init__()
+        self.trace_sink = None
         self.concat = concat
         self.dynamic = config.use_gatv2
         self.relation_attention = config.use_relation_attention
@@ -51,9 +52,12 @@ class RelationAwareAttention(nn.Module):
             scores = F.leaky_relu((attention_input * self.attention).sum(-1), 0.2)
         alpha = softmax(scores, target, num_nodes=x.size(0))
         messages = self.neighbor(x)[source]
+        gate = None
         if self.relation_messages:
             gate = torch.sigmoid(torch.einsum('nki,kio->nko', projected, self.gate))
             messages = gate * messages + torch.einsum('nki,kio->nko', projected, self.message_relation)
+        if self.trace_sink is not None:
+            self.trace_sink(edge_index, alpha, gate)
         weighted = messages * F.dropout(alpha, self.dropout, self.training).unsqueeze(-1)
         output = self.residual(x).index_add(0, target, weighted)
         return output.flatten(1) if self.concat else output.mean(1)

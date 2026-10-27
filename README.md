@@ -166,7 +166,7 @@ Each model receives the same deterministic reference split and corrupted candida
 outputs/<dataset>/noise_<ratio>/seed_<seed>/<model>/<ablation>/
 ```
 
-The aggregate report includes mean and sample standard deviation over seeds. Individual reports retain thresholds, histories, per-family anomaly metrics, and fingerprints of the actual reference data.
+The aggregate report includes mean and sample standard deviation over seeds, with optional paired-seed comparisons. Individual reports retain thresholds, histories, per-family anomaly metrics, and fingerprints of the actual reference data.
 
 The architectural ablations are:
 
@@ -274,8 +274,8 @@ The combined `filtered_triples.tsv` includes held-out partitions for graph inspe
 | `data.py` | Triple parsing, vocabulary, encoding, and explicit synthetic data |
 | `datasets.py` | Canonical partition loading and clean-reference splitting |
 | `corruption.py` | Family-specific anomaly generation and realized counts |
-| `graph.py` | Directed relational context and candidate-specific exclusion |
-| `sampling.py` | Exact receptive fields and disjoint candidate batching |
+| `graph.py` | Indexed, cached relational context and candidate-specific exclusion |
+| `sampling.py` | Exact receptive fields, resource-aware packing, and batch accounting |
 | `features.py` | Semantic-vector validation and entity feature initialization |
 | `attention.py` | Head-specific relation attention, gates, messages, and residuals |
 | `model.py` | Stacked encoder and triple validity classifier |
@@ -291,14 +291,118 @@ The combined `filtered_triples.tsv` includes held-out partitions for graph inspe
 | `reporting.py` | Candidate/score exports, anomaly analysis, and aggregation |
 | `integrity.py` | Runtime partition invariants and corrupted-data fingerprints |
 | `checkpoints.py` | Versioned neural artifacts and reference fingerprints |
-| `experiments.py` | Noise/model/seed/ablation orchestration |
+| `experiments.py` | Public facade for experiment execution |
 | `pipeline.py` | Data preparation, training, inference, and completion coordination |
 | `artifacts.py` | Consistent output directories and artifact naming |
 | `io_utils.py` | JSON, TSV, mappings, and tensor checkpoint persistence |
 | `seeding.py` | Python and PyTorch RNG initialization |
+| `indices.py` | Packed incoming adjacency, origin identities, and relation statistics |
+| `neighborhood.py` | Immutable candidate receptive fields and exact incoming expansion |
+| `cache.py` | Thread-safe LRU eviction with entry and accounted-byte limits |
+| `assembly.py` | Disjoint graph assembly and resource-budget contracts |
+| `decisions.py` | Sorted cumulative confusion curves and deterministic threshold decisions |
+| `score_diagnostics.py` | Tied-score ranking metrics, reliability, entropy, and risk/coverage summaries |
+| `diagnostics.py` | Relation/degree slices and validation/test diagnostic reports |
+| `statistics.py` | Occurrence bootstrap intervals and paired-seed comparisons |
+| `registry.py` | Model capabilities and required external input contracts |
+| `planning.py` | Immutable run identities and expansion of experiment axes |
+| `execution.py` | Serial execution, verified reuse, and experiment-level consistency |
+| `ledger.py` | Exclusive study ownership and durable run state transitions |
+| `provenance.py` | Input, implementation, and configuration fingerprints |
+| `environment.py` | Python, platform, and installed distribution metadata |
+| `manifests.py` | Complete per-run artifact inventories and checksums |
+| `telemetry.py` | Session-scoped structured training events |
+| `gradients.py` | Finite-gradient inspection and optional norm clipping |
+| `explanations.py` | Scoped capture of relation-aware attention and gate summaries |
+| `storage.py` | Atomic artifact replacement with temporary sibling files |
 
 ## Reproduction status
 
 The manuscript supplies the core architectural equations and proposed-model training settings. It leaves semantic feature extraction, the exact TMF mixture and constraints, scheduler details, threshold grid, several baseline settings, completion settings, and duplicate-occurrence discrimination unspecified. The choices and external requirements above are part of the executable protocol rather than claims about hidden experimental settings.
 
 The source changes were prepared without executing project code or adding automated tests. Runtime behavior, dependency compatibility, performance, and manuscript scores have not been validated in this workspace.
+
+## Extended execution and analysis
+
+The indexed execution, statistical diagnostics, provenance ledger, and attention summaries extend the implementation around the paper's restoration method. They are engineering and analysis facilities, not additional architectural claims from the manuscript. The default relation-aware scoring equations, corruption definitions, class weighting, and validation-only selection remain the methodological baseline. Optional gradient clipping and resource-limited packing are explicit configuration choices.
+
+### Indexed candidate contexts
+
+`RelationalIndex` stores incoming arcs in packed arrays with prefix offsets rather than maintaining a separate Python adjacency list for every node. Each arc carries the identity of its originating fact. Candidate exclusion removes both directions by that shared identity, including every occurrence collapsed into the same fact, while preserving other predicates on the same endpoints.
+
+`IncomingExpansion` returns immutable receptive fields containing global nodes, typed edges, frontier sizes, and the excluded origin identity. A per-context LRU cache stores those objects by candidate and depth. Defaults are 128 entries and 64 MiB of accounted neighborhood object storage. Shared integer objects can be counted repeatedly, making accounting conservative for those objects; the configured byte bound is not a process-RSS bound and does not include adjacency arrays, cache container overhead, tensors, or model memory. Cache counters report hits, misses, evictions, and rejected oversized entries. Set either cache limit to zero to disable storage.
+
+`CandidateAssembler` maps each cached context to a disjoint local graph. `CandidateBatcher` preserves candidate order and emits a batch when any configured candidate, node, or edge limit would be exceeded. `batch_max_nodes=0` and `batch_max_edges=0` disable those two limits. A candidate whose complete context alone exceeds a configured budget raises `ContextBudgetExceeded`; the sampler does not truncate neighbors or weaken exclusion. Nonzero packing budgets can reduce the number of candidates per optimizer update and should be recorded when comparing runs.
+
+The metrics artifact records packed index sizes, isolated entity counts, relation support, cache counters, cumulative batch counts, and peak batch sizes. These measurements describe the actual supplied graph and processed batches.
+
+### Decision curves and probability diagnostics
+
+Threshold evaluation uses sorted validity probabilities and cumulative class counts. For a threshold `tau`, anomalies are exactly the prefix with `valid_probability < tau`; tied scores equal to `tau` remain valid. This evaluates a threshold grid without constructing a candidate-by-threshold prediction matrix. Equal-F1 tie breaking follows the original proximity-to-0.5 policy.
+
+By default, `diagnostics.json` contains separate descriptive validation and test reports:
+
+- Anomaly AUROC and average precision, with equal-score groups handled together.
+- Brier score, negative log likelihood, and equal-width reliability bins for validity probabilities.
+- Expected calibration error and binary confidence/risk coverage summaries.
+- The complete configured precision/recall/F1 decision curve.
+- Relation-specific and logarithmic endpoint-degree slices, with class support for each group.
+- Optional percentile bootstrap intervals for anomaly precision, recall, and F1.
+
+Undefined ranking metrics are represented by null rather than a fabricated score. Group reports retain at most `diagnostic_max_groups` groups, ordered by occurrence support and identifier. Degree slices use the sum of endpoint typed incoming degrees in the corrupted training context; they are descriptive structural covariates, not additional classifier inputs.
+
+Inverse-frequency weighted BCE changes the interpretation of neural sigmoid outputs. The reliability report measures their behavior but does not claim they are calibrated posterior probabilities or change the decision threshold. Risk/coverage orders occurrences by `max(p, 1-p)` and reports errors at the already selected threshold; this ordering is a descriptive confidence heuristic.
+
+`bootstrap_samples=0` disables resampling. A positive value enables deterministic occurrence-level bootstrap intervals at `confidence_level`, with the validation-selected threshold held fixed. These intervals are conditional on the trained model and do not account for graph dependence, uncertainty from optimization, or threshold selection. The experiment summary additionally compares `proposed/full` against each available model or ablation on matching seeds and corruption fingerprints. Paired seed intervals resample seed-level F1 differences and are emitted only when at least two matched seeds are available. They are distinct from occurrence-level intervals, and neither interval is a significance claim.
+
+### Durable experiment execution
+
+`ExperimentPlan` expands the dataset, noise, seed, model, and ablation axes into immutable run identities and validates external model requirements before training begins. Duplicate run identities are rejected. The serialized plan is saved as `experiment_plan.json`.
+
+A study owns an exclusive `.experiment.lock` in its output root. The lock contains a process identifier, creation time, and ownership token; it is removed on normal completion or handled failure. A lock left by a terminated process must be inspected and removed manually before restarting that study. Concurrent studies should use separate output roots. This mechanism does not lock independent single-run CLI invocations.
+
+`experiment_ledger.json` records `running`, `complete`, and `failed` states. With `experiment_resume=true`, a completed run is reused only when its execution signature and all inventoried artifact checksums still match. The signature includes:
+
+- Effective requested configuration, except the resume toggle.
+- SHA-256 and sizes of relevant input files.
+- SHA-256 of the Python source modules in `kg_filtering`.
+- Python, platform, and installed dependency version metadata.
+
+Inputs and implementation signatures are checked again after an executed run. Changes during execution fail the run instead of certifying a mixed-input result. Artifact inventories include metrics, scores, histories, mappings, reference/corrupted/restored partitions, filtered output, and enabled diagnostic, explanation, telemetry, and checkpoint files. A missing or modified inventoried file invalidates reuse. This resumes at the level of completed runs; interrupted epochs and optimizer states are not resumed. A failed or interrupted run is restarted from its configured seed.
+
+The ledger is updated atomically after each transition. JSON, filtered graphs, candidate/score TSVs, and neural checkpoints are written through temporary sibling files and replaced after successful serialization and flushing. Individual artifact replacement is atomic; the complete set is not a single filesystem transaction, so the ledger certifies completion only after all required files exist. Training event logs are append-only streams with distinct session identifiers.
+
+### Optimization telemetry
+
+`training_events.jsonl` records training start, epoch completion, early stopping, completion, and failure. Epoch entries include loss, validation metrics, threshold, learning rate, optimizer-step count, training/validation elapsed time, gradient norm summaries, clipped-step counts, resource counters, and cache statistics. Counters are cumulative unless their field explicitly denotes an epoch summary.
+
+Every optimization step checks the global parameter gradient norm for finiteness. `gradient_clip_norm=0.0` leaves finite gradients unchanged. A positive norm enables clipping and records how often it occurred. `record_telemetry=0` disables the event journal while retaining history and metrics artifacts. Timing is wall-clock observation rather than a synchronized GPU performance benchmark.
+
+### Attention summaries
+
+Set `explain_candidates` to a positive count to write `attention_explanations.json` for the first encoded test occurrences after training, or the first encoded input occurrences during prediction. `explanation_top_k` bounds the incoming edges reported for each endpoint, layer, and attention head.
+
+The capture scope attaches a temporary observer to relation-aware attention layers, records normalized attention and mean relation-gate activations, and restores the previous observers and training mode afterward. The report names original entity and relation identifiers, distinguishes forward, inverse, and self relations, and includes the retained attention mass of the reported top edges. This observes the model without changing its state dictionary or inference equations. It captures attention into the candidate endpoints at each layer, rather than every intermediate node in the receptive field. Attention weights are descriptive, not causal explanations of the final classification. Models without these relation-aware layers return an explicit unavailable result.
+
+During inference, explanation records also include original input row indices so that optional unknown-token removal does not destroy alignment. Inference metrics include an unlabeled probability profile with quantiles, entropy, and histogram counts.
+
+### Extended configuration
+
+| Field | Default | Purpose |
+| --- | ---: | --- |
+| `context_cache_entries` | 128 | Maximum cached receptive fields |
+| `context_cache_bytes` | 67108864 | Accounted neighborhood storage limit |
+| `batch_max_nodes` | 0 | Maximum total nodes per candidate batch; zero disables |
+| `batch_max_edges` | 0 | Maximum total edges per candidate batch; zero disables |
+| `gradient_clip_norm` | 0.0 | Optional global gradient norm clipping |
+| `record_telemetry` | true | Append structured training events |
+| `enable_diagnostics` | true | Export descriptive validation/test diagnostics |
+| `diagnostic_bins` | 15 | Reliability and probability histogram bins |
+| `diagnostic_max_groups` | 128 | Maximum relation or structural groups per report |
+| `bootstrap_samples` | 0 | Optional occurrence and paired-seed resamples |
+| `confidence_level` | 0.95 | Percentile interval coverage |
+| `experiment_resume` | true | Reuse checksum-verified completed study runs |
+| `explain_candidates` | 0 | Number of candidates receiving attention summaries |
+| `explanation_top_k` | 8 | Incoming edges retained per endpoint/head summary |
+
+`configs/advanced.json` demonstrates a resumable multi-model study with explicit packing budgets, larger cache limits, bootstrap analysis, and attention summaries. The budget values are configuration examples rather than validated memory recommendations; some exact contexts may exceed them. These facilities add reporting and hashing overhead, and bootstrap resampling adds work proportional to the evaluation sample count and requested resamples. No project execution or runtime validation was performed while preparing these extensions.

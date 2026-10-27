@@ -3,6 +3,8 @@ import math
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
+from .registry import MODEL_REGISTRY
+
 
 @dataclass
 class Config:
@@ -78,9 +80,23 @@ class Config:
     completion_lr: float = 5e-4
     ranking_batch_size: int = 4096
     forest_estimators: int = 300
+    context_cache_entries: int = 128
+    context_cache_bytes: int = 67108864
+    batch_max_nodes: int = 0
+    batch_max_edges: int = 0
+    gradient_clip_norm: float = 0.0
+    record_telemetry: bool = True
+    enable_diagnostics: bool = True
+    diagnostic_bins: int = 15
+    diagnostic_max_groups: int = 128
+    bootstrap_samples: int = 0
+    confidence_level: float = 0.95
+    experiment_resume: bool = True
+    explain_candidates: int = 0
+    explanation_top_k: int = 8
 
     def validate(self):
-        allowed_models = {'proposed', 'random_forest', 'transe', 'gcn', 'gatv2', 'rgcn', 'compgcn', 'rule_based', 'caged'}
+        allowed_models = MODEL_REGISTRY.keys()
         if self.model_name not in allowed_models or any(name not in allowed_models for name in self.experiment_models):
             raise ValueError('Unknown model name')
         if self.mode not in {'train', 'prepare', 'predict', 'experiment'}:
@@ -91,11 +107,21 @@ class Config:
                     'classifier_hidden_dim', 'batch_size', 'max_epochs', 'patience',
                     'scheduler_patience', 'threshold_steps', 'completion_dim',
                     'completion_epochs', 'completion_batch_size', 'completion_negative_samples',
-                    'ranking_batch_size', 'forest_estimators')
+                    'ranking_batch_size', 'forest_estimators', 'diagnostic_bins', 'diagnostic_max_groups', 'explanation_top_k')
         for name in positive:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f'{name} must be a positive integer')
+        nonnegative = ('context_cache_entries', 'context_cache_bytes', 'batch_max_nodes',
+            'batch_max_edges', 'bootstrap_samples', 'explain_candidates')
+        for name in nonnegative:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f'{name} must be a nonnegative integer')
+        if not math.isfinite(self.gradient_clip_norm) or self.gradient_clip_norm < 0:
+            raise ValueError('gradient_clip_norm must be finite and nonnegative')
+        if not 0 < self.confidence_level < 1:
+            raise ValueError('confidence_level must lie strictly between zero and one')
         if self.semantic_dim < 0:
             raise ValueError('semantic_dim must be nonnegative')
         for name in ('lr', 'completion_lr', 'completion_margin'):
@@ -126,6 +152,15 @@ class Config:
             raise ValueError('inference_context must be observed or training')
         if not self.experiment_seeds:
             raise ValueError('experiment_seeds cannot be empty')
+        for value in (self.seed, self.reference_split_seed, *self.experiment_seeds):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 63:
+                raise ValueError('Seeds must be integers in [0, 2**63)')
+        if len(set(self.experiment_seeds)) != len(self.experiment_seeds):
+            raise ValueError('Experiment seeds must be unique')
+        if len(set(self.experiment_models)) != len(self.experiment_models):
+            raise ValueError('Experiment models must be unique')
+        if len(set(self.experiment_noise_ratios)) != len(self.experiment_noise_ratios):
+            raise ValueError('Experiment noise ratios must be unique')
         if any(not math.isfinite(x) or x < 0 for x in self.experiment_noise_ratios):
             raise ValueError('Invalid experiment noise ratios')
         return self

@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 from .io_utils import ensure_parent_dir
+from .storage import atomic_text
 from .metrics import evaluate_binary
 
 
@@ -22,7 +23,7 @@ def export_candidates(root, partitions):
     for name, partition in partitions.items():
         path = root / f'{name}.tsv'
         ensure_parent_dir(str(path))
-        with path.open('w', encoding='utf-8', newline='') as handle:
+        with atomic_text(path, newline='') as handle:
             writer = csv.writer(handle, delimiter='\t')
             writer.writerow(('row', 'head', 'relation', 'tail', 'label', 'anomaly_type'))
             for index, (triple, label, kind) in enumerate(zip(partition.triples, partition.labels, partition.anomaly_types)):
@@ -31,7 +32,7 @@ def export_candidates(root, partitions):
 
 def export_scores(path, partitions, probabilities, threshold):
     ensure_parent_dir(path)
-    with Path(path).open('w', encoding='utf-8', newline='') as handle:
+    with atomic_text(path, newline='') as handle:
         writer = csv.writer(handle, delimiter='\t')
         writer.writerow(('partition', 'row', 'head', 'relation', 'tail', 'valid_probability', 'retained_by_score'))
         for name, triples in partitions.items():

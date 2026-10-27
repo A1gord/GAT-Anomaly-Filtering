@@ -1,38 +1,73 @@
 import random
 from collections.abc import Iterator, Sequence
+from dataclasses import dataclass, asdict
 
-import torch
-
+from .assembly import BatchLimits, CandidateAssembler, ContextBudgetExceeded
 from .graph import RelationalContext
 from .types import CandidateBatch, TripleId
 
 
+@dataclass
+class BatchCounters:
+    batches: int = 0
+    candidates: int = 0
+    nodes: int = 0
+    edges: int = 0
+    peak_nodes: int = 0
+    peak_edges: int = 0
+
+    def observe(self, assembler: CandidateAssembler) -> None:
+        self.batches += 1
+        self.candidates += len(assembler.candidates)
+        self.nodes += len(assembler.node_ids)
+        self.edges += len(assembler.edge_types)
+        self.peak_nodes = max(self.peak_nodes, len(assembler.node_ids))
+        self.peak_edges = max(self.peak_edges, len(assembler.edge_types))
+
+
 class CandidateBatcher:
-    def __init__(self, context: RelationalContext, depth: int, batch_size: int) -> None:
-        self.context = context
-        self.depth = depth
-        self.batch_size = batch_size
+    def __init__(self, context: RelationalContext, depth: int, batch_size: int,
+                 max_nodes: int = 0, max_edges: int = 0) -> None:
+        if min(depth, batch_size) < 1 or min(max_nodes, max_edges) < 0:
+            raise ValueError('Invalid candidate batch limits')
+        self.context, self.depth, self.batch_size = context, depth, batch_size
+        self.limits = BatchLimits(batch_size, max_nodes, max_edges)
+        self.counters = BatchCounters()
+
+    @classmethod
+    def from_config(cls, context, depth, config):
+        return cls(context, depth, config.batch_size, config.batch_max_nodes, config.batch_max_edges)
 
     def collate(self, candidates: Sequence[TripleId]) -> CandidateBatch:
-        node_ids, edges, edge_types, local_candidates = [], [], [], []
-        for candidate in candidates:
-            nodes, typed_edges = self.context.neighborhood(tuple(candidate), self.depth)
-            mapping = {node: index + len(node_ids) for index, node in enumerate(nodes)}
-            h, r, t = candidate
-            local_candidates.append((mapping[h], r, mapping[t]))
-            for source, relation, target in typed_edges:
-                edges.append((mapping[source], mapping[target]))
-                edge_types.append(relation)
-            node_ids.extend(nodes)
-        return CandidateBatch(torch.tensor(node_ids, dtype=torch.long),
-            torch.tensor(edges, dtype=torch.long).reshape(-1, 2).T.contiguous(),
-            torch.tensor(edge_types, dtype=torch.long),
-            torch.tensor(local_candidates, dtype=torch.long).reshape(-1, 3))
+        assembler = CandidateAssembler()
+        for row, candidate in enumerate(candidates):
+            neighborhood = self.context.extract(tuple(candidate), self.depth)
+            if not assembler.fits(neighborhood, self.limits):
+                raise ContextBudgetExceeded(row, len(assembler.node_ids) + len(neighborhood.nodes),
+                    len(assembler.edge_types) + len(neighborhood.edges))
+            assembler.append(row, candidate, neighborhood)
+        self.counters.observe(assembler)
+        return assembler.materialize()
 
-    def batches(self, triples: Sequence[TripleId], shuffle: bool = False, seed: int = 0) -> Iterator[tuple[list[int], CandidateBatch]]:
+    def batches(self, triples: Sequence[TripleId], shuffle: bool = False,
+                seed: int = 0) -> Iterator[tuple[list[int], CandidateBatch]]:
         indices = list(range(len(triples)))
         if shuffle:
             random.Random(seed).shuffle(indices)
-        for start in range(0, len(indices), self.batch_size):
-            selection = indices[start:start + self.batch_size]
-            yield selection, self.collate([triples[index] for index in selection])
+        assembler = CandidateAssembler()
+        for row in indices:
+            candidate = tuple(triples[row])
+            neighborhood = self.context.extract(candidate, self.depth)
+            if assembler.candidates and not assembler.fits(neighborhood, self.limits):
+                self.counters.observe(assembler)
+                yield assembler.row_indices, assembler.materialize()
+                assembler = CandidateAssembler()
+            if not assembler.fits(neighborhood, self.limits):
+                raise ContextBudgetExceeded(row, len(neighborhood.nodes), len(neighborhood.edges))
+            assembler.append(row, candidate, neighborhood)
+        if assembler.candidates:
+            self.counters.observe(assembler)
+            yield assembler.row_indices, assembler.materialize()
+
+    def describe(self) -> dict:
+        return {**asdict(self.counters), 'limits': asdict(self.limits), 'depth': self.depth}

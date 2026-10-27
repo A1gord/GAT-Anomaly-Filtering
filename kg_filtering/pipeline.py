@@ -13,6 +13,11 @@ from .corruption import build_corrupted_splits
 from .data import build_entity_relation_vocab, build_mappings, encode_triples, encode_triples_with_mask, load_triples
 from .datasets import load_reference_splits
 from .external import load_external_probabilities
+from .diagnostics import build_diagnostics
+from .environment import runtime_descriptor
+from .explanations import explain_candidates
+from .registry import model_spec
+from .score_diagnostics import probability_profile
 from .features import load_semantic_features
 from .graph import RelationalContext
 from .integrity import audit_partitions, corruption_fingerprint
@@ -40,7 +45,7 @@ def prepare_data(config):
     entities, relations = build_entity_relation_vocab(sorted(reference.positives))
     ent2id, rel2id, id2ent, id2rel = build_mappings(entities, relations)
     encoded = {name: encode_triples(partition.triples, ent2id, rel2id) for name, partition in partitions.items()}
-    context = RelationalContext(encoded['train'], len(entities), len(relations), config.use_inverse_relations)
+    context = RelationalContext(encoded['train'], len(entities), len(relations), config.use_inverse_relations, config.context_cache_entries, config.context_cache_bytes)
     export_candidates(Path(config.output_dir) / 'candidates', partitions)
     for name, clean in zip(('train', 'valid', 'test'), (reference.train, reference.valid, reference.test)):
         export_filtered_graph(clean, [1.0] * len(clean), 0.5,
@@ -67,11 +72,14 @@ def run_prepare_pipeline(config):
 def run_train_pipeline(config):
     config = resolve_artifact_paths(config)
     config = replace(config, device=resolve_device(config.device))
+    config.validate()
+    model_spec(config.model_name).validate_inputs(config)
     set_seed(config.seed)
     reference, partitions, encoded, context, mappings = prepare_data(config)
     ent2id, rel2id, id2ent, id2rel = mappings
     labels = {name: partition.labels for name, partition in partitions.items()}
     model = None
+    batcher = None
     history, best_epoch = [], None
     if config.model_name == 'random_forest':
         probabilities = fit_random_forest(encoded, labels, context, config)
@@ -87,7 +95,7 @@ def run_train_pipeline(config):
         if hasattr(model, 'encoder'):
             model.encoder.features.semantic.copy_(semantic.to(config.device))
         depth = config.num_layers + int(config.model_name == 'gcn')
-        batcher = CandidateBatcher(context, depth, config.batch_size)
+        batcher = CandidateBatcher.from_config(context, depth, config)
         output = train_model(model, encoded, labels, batcher, config)
         probabilities, history, best_epoch = output.probabilities, output.history, output.best_epoch
     threshold = select_threshold(labels['valid'], probabilities['valid'], config)
@@ -109,6 +117,22 @@ def run_train_pipeline(config):
         'semantic_features_used': bool(model is not None and hasattr(model, 'encoder') and
             config.semantic_dim and config.use_semantic_features),
         'duplicate_identifiability': 'Identical triples have identical model inputs; deduplication is a separate export operation.'}
+    payload['runtime'] = runtime_descriptor()
+    payload['context'] = context.describe()
+    payload['batching'] = None if batcher is None else batcher.describe()
+    if config.enable_diagnostics:
+        diagnostic_path = str(Path(config.output_dir) / 'diagnostics.json')
+        diagnostics = {name: build_diagnostics(partitions[name], probabilities[name], encoded[name],
+            context, threshold, config) for name in ('valid', 'test')}
+        save_json(diagnostic_path, diagnostics)
+        payload['diagnostics_path'] = diagnostic_path
+    if model is not None and config.explain_candidates:
+        explanation_path = str(Path(config.output_dir) / 'attention_explanations.json')
+        explanation = explain_candidates(model, encoded['test'], batcher, ent2id, rel2id,
+            config.device, config.explain_candidates, config.explanation_top_k)
+        explanation['partition'] = 'test'
+        save_json(explanation_path, explanation)
+        payload['explanations_path'] = explanation_path
     if config.run_completion:
         restored_train = [triple for triple, score in zip(partitions['train'].triples, probabilities['train']) if score >= threshold]
         payload['completion'] = compare_completion(reference, partitions['train'].triples,
@@ -137,8 +161,8 @@ def run_predict_pipeline(config):
     model = build_model(len(ent2id), len(rel2id), trained).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
     context_triples = encoded if config.inference_context == 'observed' else checkpoint['context_triples']
-    context = RelationalContext(context_triples, len(ent2id), len(rel2id), trained.use_inverse_relations)
-    batcher = CandidateBatcher(context, trained.num_layers + int(trained.model_name == 'gcn'), config.batch_size)
+    context = RelationalContext(context_triples, len(ent2id), len(rel2id), trained.use_inverse_relations, config.context_cache_entries, config.context_cache_bytes)
+    batcher = CandidateBatcher.from_config(context, trained.num_layers + int(trained.model_name == 'gcn'), config)
     probabilities = predict_probabilities(model, encoded, batcher, device)
     threshold = checkpoint['best_threshold']
     known_triples = [triples[index] for index in indices]
@@ -149,9 +173,20 @@ def run_predict_pipeline(config):
     export_scores(config.output_scores_path, {'predict': known_triples}, {'predict': probabilities}, threshold)
     save_json(str(Path(config.output_dir) / 'prediction_alignment.json'), {
         'original_row_indices': indices, 'valid_probabilities': score_vector})
+    explanation_path = None
+    if config.explain_candidates:
+        explanation_path = str(Path(config.output_dir) / 'attention_explanations.json')
+        explanation = explain_candidates(model, encoded, batcher, ent2id, rel2id, device,
+            config.explain_candidates, config.explanation_top_k)
+        for candidate in explanation['candidates']:
+            candidate['original_input_row'] = indices[candidate['row']]
+        save_json(explanation_path, explanation)
     payload = {'mode': 'predict', 'threshold': threshold, 'total_input_triples': len(triples),
         'encoded_triples': len(encoded), 'dropped_unknown_triples': len(triples) - len(encoded),
         'num_filtered_kept': kept, 'context': config.inference_context,
+        'context_statistics': context.describe(), 'batching': batcher.describe(),
+        'runtime': runtime_descriptor(), 'probability_profile': probability_profile(probabilities, config.diagnostic_bins),
+        'explanations_path': explanation_path,
         'restoration': restoration_counts(known_triples, probabilities, threshold)}
     save_json(config.output_metrics_path, payload)
     return payload

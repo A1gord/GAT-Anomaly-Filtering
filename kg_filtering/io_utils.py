@@ -3,14 +3,15 @@ from pathlib import Path
 
 import torch
 
+from .storage import atomic_destination, atomic_text, write_json_atomic
+
 
 def ensure_parent_dir(path):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
 def save_json(path, payload):
-    ensure_parent_dir(path)
-    Path(path).write_text(json.dumps(payload, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
+    write_json_atomic(path, payload)
 
 
 def load_json(path):
@@ -20,17 +21,16 @@ def load_json(path):
 def export_filtered_graph(triples, probabilities, threshold, output_path):
     if len(triples) != len(probabilities):
         raise ValueError('Triple and probability counts differ')
-    ensure_parent_dir(output_path)
     kept = dict.fromkeys(triple for triple, probability in zip(triples, probabilities) if probability >= threshold)
-    with Path(output_path).open('w', encoding='utf-8') as handle:
-        for h, r, t in kept:
-            handle.write(f'{h}\t{r}\t{t}\n')
+    with atomic_text(output_path) as handle:
+        for head, relation, tail in kept:
+            handle.write(f'{head}\t{relation}\t{tail}\n')
     return len(kept)
 
 
 def save_checkpoint(path, payload):
-    ensure_parent_dir(path)
-    torch.save(payload, path)
+    with atomic_destination(path) as temporary:
+        torch.save(payload, temporary)
 
 
 def load_checkpoint(path):
