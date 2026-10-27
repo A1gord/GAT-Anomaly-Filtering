@@ -1,65 +1,49 @@
-from typing import Dict, Tuple
-
 import torch
-from torch import Tensor
 
 
-def compute_sample_weights(labels: Tensor) -> Tensor:
-    n = labels.numel()
-    positives = labels.sum().item()
-    negatives = float(n) - positives
-    if positives == 0.0 or negatives == 0.0:
-        return torch.ones_like(labels)
-    w_pos = labels.new_tensor(float(n) / (2.0 * positives))
-    w_neg = labels.new_tensor(float(n) / (2.0 * negatives))
-    return torch.where(labels > 0.5, w_pos, w_neg)
+def compute_sample_weights(labels):
+    counts = torch.bincount(labels.long(), minlength=2).clamp_min(1)
+    return labels.numel() / (2 * counts[labels.long()].to(labels.dtype))
 
 
-def precision_recall_f1(y_true: Tensor, y_pred: Tensor) -> Tuple[float, float, float]:
-    y_true_int = y_true.long()
-    y_pred_int = y_pred.long()
-    tp = int(((y_true_int == 1) & (y_pred_int == 1)).sum().item())
-    fp = int(((y_true_int == 0) & (y_pred_int == 1)).sum().item())
-    fn = int(((y_true_int == 1) & (y_pred_int == 0)).sum().item())
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    f1 = (
-        2.0 * precision * recall / (precision + recall)
-        if (precision + recall) > 0
-        else 0.0
-    )
+def precision_recall_f1(y_true, y_pred):
+    true, pred = y_true.bool(), y_pred.bool()
+    tp = int((true & pred).sum())
+    fp = int((~true & pred).sum())
+    fn = int((true & ~pred).sum())
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.0
     return precision, recall, f1
 
 
-def evaluate_binary(
-    labels: Tensor, probabilities: Tensor, threshold: float
-) -> Dict[str, float]:
-    predictions = (probabilities >= threshold).float()
-    precision, recall, f1 = precision_recall_f1(labels, predictions)
-    return {"precision": precision, "recall": recall, "f1": f1}
+def evaluate_binary(labels, probabilities, threshold):
+    labels = torch.as_tensor(labels).cpu()
+    probabilities = torch.as_tensor(probabilities).cpu()
+    if labels.shape != probabilities.shape or not labels.numel():
+        raise ValueError('Metrics require equally sized nonempty vectors')
+    if not torch.isfinite(probabilities).all() or ((probabilities < 0) | (probabilities > 1)).any():
+        raise ValueError('Validity probabilities must lie in [0, 1]')
+    predictions = probabilities >= threshold
+    precision, recall, f1 = precision_recall_f1(labels == 0, ~predictions)
+    valid_p, valid_r, valid_f1 = precision_recall_f1(labels == 1, predictions)
+    return {'precision': precision, 'recall': recall, 'f1': f1,
+        'valid_precision': valid_p, 'valid_recall': valid_r, 'valid_f1': valid_f1,
+        'accuracy': float((predictions == labels.bool()).float().mean()),
+        'tp': int(((labels == 0) & ~predictions).sum()),
+        'fp': int(((labels == 1) & ~predictions).sum()),
+        'tn': int(((labels == 1) & predictions).sum()),
+        'fn': int(((labels == 0) & predictions).sum())}
 
 
-def find_best_threshold(
-    labels: Tensor,
-    probabilities: Tensor,
-    threshold_min: float,
-    threshold_max: float,
-    threshold_steps: int,
-) -> Tuple[float, Dict[str, float]]:
-    if threshold_steps < 2:
-        metrics = evaluate_binary(labels, probabilities, threshold_min)
-        return threshold_min, metrics
-    thresholds = torch.linspace(
-        threshold_min, threshold_max, steps=threshold_steps, device=probabilities.device
-    )
-    best_threshold = float(thresholds[0].item())
-    best_metrics = evaluate_binary(labels, probabilities, best_threshold)
-    best_f1 = best_metrics["f1"]
-    for threshold in thresholds[1:]:
-        value = float(threshold.item())
-        metrics = evaluate_binary(labels, probabilities, value)
-        if metrics["f1"] > best_f1:
-            best_f1 = metrics["f1"]
-            best_threshold = value
-            best_metrics = metrics
-    return best_threshold, best_metrics
+def find_best_threshold(labels, probabilities, threshold_min, threshold_max, threshold_steps):
+    thresholds = torch.linspace(threshold_min, threshold_max, threshold_steps).tolist()
+    scored = [(threshold, evaluate_binary(labels, probabilities, threshold)) for threshold in thresholds]
+    return max(scored, key=lambda pair: (pair[1]['f1'], -abs(pair[0] - 0.5), -pair[0]))
+
+
+def select_threshold(labels, probabilities, config):
+    if config.optimize_threshold:
+        return find_best_threshold(labels, probabilities, config.threshold_min,
+            config.threshold_max, config.threshold_steps)[0]
+    return config.threshold

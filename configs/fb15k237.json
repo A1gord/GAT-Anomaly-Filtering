@@ -1,0 +1,16 @@
+{
+  "dataset": "fb15k-237",
+  "dataset_dir": "data/FB15K-237",
+  "embedding_dim": 128,
+  "relation_dim": 64,
+  "num_layers": 2,
+  "num_heads": 8,
+  "batch_size": 256,
+  "noise_ratio": 0.1,
+  "spurious_fraction": 0.5,
+  "substitution_fraction": 0.5,
+  "redundant_fraction": 0.0,
+  "experiment_noise_ratios": [0.05, 0.1, 0.15],
+  "experiment_seeds": [13, 37, 71, 101, 137],
+  "experiment_models": ["proposed", "random_forest", "transe", "gcn", "gatv2", "rgcn", "compgcn"]
+}

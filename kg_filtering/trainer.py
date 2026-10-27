@@ -1,134 +1,67 @@
 from dataclasses import dataclass
-from typing import Dict, List
 
 import torch
-import torch.nn.functional as F
-from torch import Tensor
+from torch.nn import functional as F
 
-from .config import Config
-from .metrics import compute_sample_weights, evaluate_binary, find_best_threshold
-from .model import EdgeValidityModel
+from .metrics import compute_sample_weights, evaluate_binary, select_threshold
+from .optimization import EarlyStopping, build_optimizer
 
 
 @dataclass
 class TrainingOutput:
     best_threshold: float
     best_val_f1: float
-    history: List[Dict[str, float]]
-    val_metrics: Dict[str, float]
-    test_metrics: Dict[str, float]
-    all_probabilities: List[float]
-    train_loss: float
+    best_epoch: int
+    history: list
+    val_metrics: dict
+    test_metrics: dict
+    probabilities: dict
 
 
-def predict_probabilities(
-    model: EdgeValidityModel,
-    triples: Tensor,
-    edge_index: Tensor,
-    edge_weight: Tensor | None,
-) -> Tensor:
+@torch.no_grad()
+def predict_probabilities(model, triples, batcher, device):
     model.eval()
-    with torch.no_grad():
-        logits = model(triples, edge_index, edge_weight)
-        probs = torch.sigmoid(logits)
-    return probs
+    result = torch.empty(len(triples))
+    for indices, batch in batcher.batches(triples):
+        result[indices] = model(batch.to(device)).sigmoid().cpu()
+    return result
 
 
-def evaluate_model(
-    model: EdgeValidityModel,
-    triples: Tensor,
-    labels: Tensor,
-    edge_index: Tensor,
-    edge_weight: Tensor | None,
-    threshold: float,
-) -> Dict[str, float]:
-    probs = predict_probabilities(model, triples, edge_index, edge_weight)
-    return evaluate_binary(labels, probs, threshold)
-
-
-def train_model(
-    model: EdgeValidityModel,
-    optimizer: torch.optim.Optimizer,
-    train_triples: Tensor,
-    train_labels: Tensor,
-    val_triples: Tensor,
-    val_labels: Tensor,
-    test_triples: Tensor,
-    test_labels: Tensor,
-    all_triples: Tensor,
-    edge_index: Tensor,
-    edge_weight: Tensor | None,
-    config: Config,
-) -> TrainingOutput:
-    train_weights = compute_sample_weights(train_labels)
-    best_val_f1 = -1.0
-    best_state: Dict[str, Tensor] | None = None
-    stale_epochs = 0
-    history: List[Dict[str, float]] = []
-    last_train_loss = 0.0
+def train_model(model, encoded, labels, batcher, config):
+    optimizer, scheduler = build_optimizer(model, config)
+    stopper = EarlyStopping(config.patience)
+    targets = torch.tensor(labels['train'], dtype=torch.float32, device=config.device)
+    weights = compute_sample_weights(targets)
+    history = []
     for epoch in range(1, config.max_epochs + 1):
         model.train()
-        optimizer.zero_grad()
-        train_logits = model(train_triples, edge_index, edge_weight)
-        train_loss = F.binary_cross_entropy_with_logits(
-            train_logits, train_labels, weight=train_weights
-        )
-        train_loss.backward()
-        optimizer.step()
-        last_train_loss = float(train_loss.item())
-        val_probs = predict_probabilities(model, val_triples, edge_index, edge_weight)
-        val_metrics = evaluate_binary(val_labels, val_probs, config.threshold)
-        history.append(
-            {
-                "epoch": float(epoch),
-                "loss": last_train_loss,
-                "val_precision": val_metrics["precision"],
-                "val_recall": val_metrics["recall"],
-                "val_f1": val_metrics["f1"],
-            }
-        )
-        if val_metrics["f1"] > best_val_f1:
-            best_val_f1 = val_metrics["f1"]
-            best_state = {
-                k: v.detach().cpu().clone() for k, v in model.state_dict().items()
-            }
-            stale_epochs = 0
-        else:
-            stale_epochs += 1
-        if epoch == 1 or epoch % 10 == 0:
-            print(
-                f"epoch={epoch} loss={last_train_loss:.6f} "
-                f"val_precision={val_metrics['precision']:.4f} "
-                f"val_recall={val_metrics['recall']:.4f} "
-                f"val_f1={val_metrics['f1']:.4f}"
-            )
-        if stale_epochs >= config.patience:
-            print(f"early_stopping_epoch={epoch} best_val_f1={best_val_f1:.4f}")
+        total_loss = 0.0
+        for indices, batch in batcher.batches(encoded['train'], shuffle=True, seed=config.seed + epoch):
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(batch.to(config.device))
+            loss = F.binary_cross_entropy_with_logits(logits, targets[indices], weight=weights[indices])
+            if not torch.isfinite(loss):
+                raise FloatingPointError(f'Nonfinite loss at epoch {epoch}')
+            loss.backward()
+            optimizer.step()
+            total_loss += float(loss.detach()) * len(indices)
+        probabilities = predict_probabilities(model, encoded['valid'], batcher, config.device)
+        threshold = select_threshold(labels['valid'], probabilities, config)
+        metrics = evaluate_binary(labels['valid'], probabilities, threshold)
+        history.append({'epoch': epoch, 'loss': total_loss / len(encoded['train']),
+            'val_f1': metrics['f1'], 'val_precision': metrics['precision'],
+            'val_recall': metrics['recall'], 'threshold': threshold,
+            'lr': optimizer.param_groups[0]['lr']})
+        scheduler.step(metrics['f1'])
+        stop = stopper.update(metrics['f1'], model, epoch)
+        if epoch == 1 or epoch % 10 == 0 or stop:
+            print(f"epoch={epoch} loss={history[-1]['loss']:.6f} val_anomaly_f1={metrics['f1']:.4f}")
+        if stop:
             break
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    val_probs = predict_probabilities(model, val_triples, edge_index, edge_weight)
-    if config.optimize_threshold:
-        best_threshold, _ = find_best_threshold(
-            labels=val_labels,
-            probabilities=val_probs,
-            threshold_min=config.threshold_min,
-            threshold_max=config.threshold_max,
-            threshold_steps=config.threshold_steps,
-        )
-    else:
-        best_threshold = config.threshold
-    val_metrics = evaluate_binary(val_labels, val_probs, best_threshold)
-    test_probs = predict_probabilities(model, test_triples, edge_index, edge_weight)
-    test_metrics = evaluate_binary(test_labels, test_probs, best_threshold)
-    all_probs = predict_probabilities(model, all_triples, edge_index, edge_weight)
-    all_probabilities = all_probs.detach().cpu().tolist()
-    return TrainingOutput(
-        best_threshold=best_threshold,
-        best_val_f1=best_val_f1,
-        history=history,
-        val_metrics=val_metrics,
-        test_metrics=test_metrics,
-        all_probabilities=all_probabilities,
-        train_loss=last_train_loss,
-    )
+    stopper.restore(model)
+    probabilities = {name: predict_probabilities(model, triples, batcher, config.device)
+        for name, triples in encoded.items()}
+    threshold = select_threshold(labels['valid'], probabilities['valid'], config)
+    return TrainingOutput(threshold, stopper.score, stopper.epoch, history,
+        evaluate_binary(labels['valid'], probabilities['valid'], threshold),
+        evaluate_binary(labels['test'], probabilities['test'], threshold), probabilities)

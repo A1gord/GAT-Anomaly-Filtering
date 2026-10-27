@@ -1,0 +1,8 @@
+{
+  "mode": "predict",
+  "checkpoint_path": "outputs/best_model.pt",
+  "inference_graph_path": "data/inference_triples.tsv",
+  "inference_context": "observed",
+  "drop_unknown_in_predict": false,
+  "batch_size": 256
+}

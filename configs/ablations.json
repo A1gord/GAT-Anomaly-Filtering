@@ -1,0 +1,10 @@
+{
+  "mode": "experiment",
+  "dataset": "fb15k-237",
+  "dataset_dir": "data/FB15K-237",
+  "entity_features_path": "data/FB15K-237/entity_features.json",
+  "run_ablations": true,
+  "experiment_models": ["proposed"],
+  "experiment_noise_ratios": [0.1],
+  "experiment_seeds": [13, 37, 71, 101, 137]
+}

@@ -1,0 +1,16 @@
+{
+  "entity_types": {
+    "example_process": ["Process"],
+    "example_subprocess": ["Process"],
+    "example_application": ["Application"]
+  },
+  "relation_domains": {
+    "contains": ["Process"],
+    "supports": ["Application"]
+  },
+  "relation_ranges": {
+    "contains": ["Process"],
+    "supports": ["Process"]
+  },
+  "hierarchical_relations": ["contains"]
+}

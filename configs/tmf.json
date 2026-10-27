@@ -1,0 +1,12 @@
+{
+  "dataset": "tmf-kg",
+  "clean_graph_path": "data/TMF-KG/clean_triples.tsv",
+  "reference_split_seed": 13,
+  "noise_ratio": 0.2,
+  "spurious_fraction": 1.0,
+  "substitution_fraction": 1.0,
+  "redundant_fraction": 1.0,
+  "experiment_noise_ratios": [0.1, 0.2, 0.3, 0.4],
+  "experiment_seeds": [13, 37, 71, 101, 137],
+  "experiment_models": ["proposed", "random_forest", "transe", "gcn", "gatv2", "rgcn", "compgcn"]
+}
